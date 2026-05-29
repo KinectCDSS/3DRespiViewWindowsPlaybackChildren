@@ -1,13 +1,12 @@
-import {useEffect, useState} from 'react';
-import {Line} from 'react-chartjs-2';
+import { useEffect, useState } from 'react';
+import { Line } from 'react-chartjs-2';
 import Chart from 'chart.js/auto';
 import RespiratoryStats from "./respiratory.jsx";
-import {Button, LinearProgress, Typography} from "@mui/material";
-import {createRef} from "react";
+import { Button, LinearProgress, Typography } from "@mui/material";
+import { createRef } from "react";
 import html2canvas from "html2canvas";
 
-
-const RealTimeChart = () => {
+const RealTimeChart = ({ filename, isOffline }) => {
     const [rawData, setRawData] = useState([]);
     const [filteredData, setFilteredRdata] = useState([]);
     const [flowData, setFlowData] = useState([]);
@@ -74,13 +73,37 @@ const RealTimeChart = () => {
 
             }
         }
+
+        // Sécurité de nettoyage de l'EventSource si le composant est démonté
+        return () => {
+            eventSource.close();
+        };
     }, []);
+
+    // =========================================================================
+    // CORRECTION COUPE-CIRCUIT : On n'active l'intervalle d'image QUE si isOffline est FAUX
+    // =========================================================================
+    useEffect(() => {
+        if (isOffline) return; // Stoppe net les requêtes HTTP fantômes en mode analyse !
+
+        const intervalImage = setInterval(() => {
+            const img = document.getElementById("live-image");
+            if (img) {
+                img.src = "http://localhost:8000/image/IR4OBB.jpg?t=" + new Date().getTime();
+            }
+        }, 100); // Rafraîchissement progressif de la caméra
+
+        return () => clearInterval(intervalImage); // Nettoyage de l'intervalle
+    }, [isOffline]);
 
     useEffect(() => {
         if (end) {
             console.log("Récupération des donneés mathématiques.");
-            // Faire un appel GET sur l'API Flask pour récupérer les données
-            fetch('http://localhost:8000/stats')
+
+            // CORRECTION CLÉ : On transmet systématiquement le filename au backend pour l'écriture des fichiers
+            const urlStats = `http://localhost:8000/stats?filename=${encodeURIComponent(filename)}`;
+
+            fetch(urlStats)
                 .then(response => response.json())
                 .then(data => {
                     setStats(data);  // Mettre à jour l'état avec les données récupérées
@@ -115,10 +138,10 @@ const RealTimeChart = () => {
                 })
                 .catch(error => console.error('Erreur de récupération des statistiques:', error));
         }
-    }, [end]);
+    }, [end, isOffline, filename]);
 
     const chartDataVolume = {
-        labels: Array.from({length: 900}, (_, index) => (index / 30)),
+        labels: Array.from({ length: 900 }, (_, index) => (index / 30)),
         datasets: [
             {
                 label: 'Données brutes',
@@ -164,7 +187,7 @@ const RealTimeChart = () => {
     };
 
     const chartDataFlow = {
-        labels: Array.from({length: 900}, (_, index) => (index / 30)),
+        labels: Array.from({ length: 900 }, (_, index) => (index / 30)),
         datasets: [
             {
                 label: 'Flow',
@@ -200,7 +223,6 @@ const RealTimeChart = () => {
         ],
     };
 
-
     const optionsVolume = {
         responsive: true,
         maintainAspectRatio: false,
@@ -227,13 +249,11 @@ const RealTimeChart = () => {
                     display: true,
                     text: 'Amplitude (mL)'  // Titre de l'axe Y
                 },
-                //min: -2000,
-                //max: 2000,
             }
         },
         animation: {
             duration: 0,  // Définir la durée de l'animation à 0 pour désactiver l'animation
-            easing: 'linear',  // Optionnel, définit le type d'animation si jamais vous voulez en laisser une
+            easing: 'linear',
         },
         plugins: {
             title: {
@@ -252,7 +272,6 @@ const RealTimeChart = () => {
             },
         },
     };
-
 
     const optionsFlow = {
         responsive: true,
@@ -280,13 +299,11 @@ const RealTimeChart = () => {
                     display: true,
                     text: 'Amplitude (mL)',  // Titre de l'axe Y
                 },
-                //min: -2000,
-                //max: 2000,
             }
         },
         animation: {
-            duration: 0,  // Définir la durée de l'animation à 0 pour désactiver l'animation
-            easing: 'linear',  // Optionnel, définit le type d'animation si jamais vous voulez en laisser une
+            duration: 0,
+            easing: 'linear',
         },
         plugins: {
             title: {
@@ -306,29 +323,20 @@ const RealTimeChart = () => {
         },
     };
 
-
     const closeAll = async () => {
         try {
-            // Envoi de la requête fetch
-            const response = await fetch('http://localhost:8000/close', {
-                method: 'POST',  // Assure-toi que la méthode soit correcte (POST ou GET)
+            // 1. On prévient le serveur de tout couper
+            await fetch('http://localhost:8000/close', {
+                method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json', // Si nécessaire, selon ton API
+                    'Content-Type': 'application/json',
                 },
-                // body: JSON.stringify(data), // Si tu as besoin d'envoyer des données
             });
-
-            if (!response.ok) {
-                // Vérifie si la requête a échoué (code HTTP différent de 2xx)
-                throw new Error(`Erreur lors de la requête: ${response.statusText}`);
-            }
-
-            const data = await response.json(); // Récupère la réponse sous forme JSON (si nécessaire)
-            console.log('Réponse du serveur:', data);
-
         } catch (error) {
-            // Gérer les erreurs (par exemple, problème réseau, erreur API)
-            console.error('Erreur lors de la requête:', error);
+            console.error('Erreur lors de la fermeture :', error);
+        } finally {
+            // 2. On force la fermeture de l'onglet du navigateur web
+            window.close();
         }
     };
 
@@ -341,15 +349,15 @@ const RealTimeChart = () => {
             width: '99vw'
         }}>
             {/* Graphique en haut de la page */}
-            <div style={{width: '98vw', height: '30vh'}}>
-                <Line data={chartDataVolume} options={optionsVolume}/>
+            <div style={{ width: '98vw', height: '30vh' }}>
+                <Line data={chartDataVolume} options={optionsVolume} />
             </div>
             {/* Graphique du flow en bas de la page */}
-            <div style={{width: '98vw', height: '30vh'}}> {/* Conteneur parent avec taille dynamique */}
-                <Line data={chartDataFlow} options={optionsFlow}/>
+            <div style={{ width: '98vw', height: '30vh' }}>
+                <Line data={chartDataFlow} options={optionsFlow} />
             </div>
-            <div style={{display: "flex", justifyContent: "space-between"}}>
-                <RespiratoryStats stats={stats}/>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <RespiratoryStats stats={stats} />
                 <div style={{
                     width: '50%',
                     marginRight: "10vh",
@@ -357,26 +365,37 @@ const RealTimeChart = () => {
                     flexDirection: "row",
                     justifyContent: "space-evenly"
                 }}>
-                    <div style={{display: "flex", flexDirection: "column"}}>
-                        <img src="http://localhost:8000/image/IR4OBB.jpg" alt="Image IR4OBB" style={{height: "25vh", margin: "auto"}} onError={(e) => {
-                            e.target.onerror = null; // Prevent infinite loop
-                            setTimeout(() => {
-                                e.target.src = "http://localhost:8000/image/IR4OBB.jpg";
-                            }, 3000); // Retry after 5 seconds
-                        }}/>
-                        {/*<img*/}
-                        {/*    src="https://img.freepik.com/photos-gratuite/gros-plan-vertical-tire-belle-rose-sauvage-rose-flou_181624-32482.jpg"*/}
-                        {/*    alt="Image IR4OBB" style={{height: "25vh", margin: "auto"}}/>*/}
-                        <Typography variant="h6" align="center">Région du thorax détectée</Typography>
+                    <div style={{ display: "flex", flexDirection: "column" }}>
+
+                        {!isOffline ? (
+                            <img id="live-image" src="http://localhost:8000/image/IR4OBB.jpg" alt="Image IR4OBB" style={{ height: "25vh", margin: "auto" }} onError={(e) => {
+                                e.target.onerror = null;
+                                setTimeout(() => {
+                                    e.target.src = "http://localhost:8000/image/IR4OBB.jpg";
+                                }, 3000);
+                            }} />
+                        ) : (
+                            <div style={{ height: "25vh", display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", backgroundColor: "#fff", padding: "10px", border: "1px solid #ddd", borderRadius: "4px", margin: "auto" }}>
+                                <Typography variant="subtitle1" sx={{ fontWeight: 'bold', color: '#2e7d32' }}>
+                                    Signal Appareil Actif
+                                </Typography>
+                                <Typography variant="caption" color="textSecondary" align="center">
+                                    Source : {filename}
+                                </Typography>
+                            </div>
+                        )}
+                        <Typography variant="h6" align="center">
+                            {!isOffline ? "Région du thorax détectée" : "Mode Fichier Autonome"}
+                        </Typography>
                     </div>
 
-                    <div style={{display: "flex", flexDirection: "column", justifyContent: "space-evenly"}}>
+                    <div style={{ display: "flex", flexDirection: "column", justifyContent: "space-evenly" }}>
                         <Button
                             variant="contained"
                             onClick={captureScreenshot}
                             sx={{
                                 backgroundColor: '#4caf50',
-                                '&:hover': {backgroundColor: '#388e3c'},
+                                '&:hover': { backgroundColor: '#388e3c' },
                                 fontWeight: 'bold',
                                 borderRadius: 10,
                             }}>
@@ -388,7 +407,7 @@ const RealTimeChart = () => {
                             onClick={closeAll}
                             sx={{
                                 backgroundColor: '#D7707E',
-                                '&:hover': {backgroundColor: '#7c041b'},
+                                '&:hover': { backgroundColor: '#7c041b' },
                                 fontWeight: 'bold',
                                 borderRadius: 10,
                             }}>
@@ -399,8 +418,7 @@ const RealTimeChart = () => {
             </div>
 
         </div>
-    )
-        ;
+    );
 }
 
 export default RealTimeChart;

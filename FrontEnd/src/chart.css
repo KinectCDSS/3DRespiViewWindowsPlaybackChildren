@@ -1,12 +1,17 @@
 /* Vous pouvez également ajouter des styles pour les listes dans les statistiques */
+
 ul {
     list-style-type: none;
     padding-left: 0;
 }
 
+
+
 .MuiListItemText-root {
     line-height: 0;
 }
+
+
 
 .statsItemsBloc {
     border-color: #189ab4;
