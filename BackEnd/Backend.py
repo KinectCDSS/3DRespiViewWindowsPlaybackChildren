@@ -16,7 +16,7 @@ CORS(app)
 host = '127.0.0.1'
 port = 5000
 sampling_rate_kinect_hz = 30  
-butter_order = 2
+butter_order = 1
 
 mode_offline_actif = False
 signal_offline_raw = []
@@ -34,28 +34,18 @@ flagScale = True
 scale = 0
 
 def clean_output_directories():
-    """Supprime tout le contenu des dossiers Output et output au démarrage du backend."""
-    dossiers_a_vider = ['./Output', './output']
-    print("=====================================================================")
-    print("             NETTOYAGE DES DOSSIERS DE SORTIE (OUTPUT)")
-    print("=====================================================================")
+    """Initialise les dossiers et nettoie uniquement les résidus YOLO au démarrage."""
+    os.makedirs('./Output', exist_ok=True)
+    os.makedirs('./output', exist_ok=True)
     
-    for dossier in dossiers_a_vider:
-        if os.path.exists(dossier):
-            for filename in os.listdir(dossier):
-                file_path = os.path.join(dossier, filename)
-                try:
-                    if os.path.isfile(file_path) or os.path.islink(file_path):
-                        os.unlink(file_path)
-                    elif os.path.isdir(file_path):
-                        shutil.rmtree(file_path)
-                    print(f"[Supprimé] {file_path}")
-                except Exception as e:
-                    print(f"[Erreur] Impossible de supprimer {file_path} : {e}")
-        else:
-            os.makedirs(dossier, exist_ok=True)
-            print(f"[Créé] Dossier initialisé : {dossier}")
-    print("=====================================================================\n")
+    # Nettoyage préventif du dossier de prédiction YOLO pour éviter les conflits de session
+    runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runs')
+    if os.path.exists(runs_dir):
+        try:
+            shutil.rmtree(runs_dir)
+            print("[Démarrage] Ancien répertoire de prédictions YOLO nettoyé.")
+        except Exception as e:
+            print(f"[Démarrage] Avis de nettoyage du dossier runs : {e}")
 
 def remove_outliers(data):
     if len(data) < 2: return data
@@ -76,7 +66,7 @@ def store_non_filtered_data_in_csv(data):
     filepath = os.path.join(output_dir, filename)
     with open(filepath, mode='a', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
-        for value in data: writer.writerow([value])
+        for value in data: writer.writerow([f"{value:.15f}"])
 
 def store_data_in_csv(data):
     global current_filename
@@ -92,62 +82,63 @@ def generate_data():
     global x_data, y_data, scale, flag, flagScale, y_filtered_data, dy_dx
     global mode_offline_actif, signal_offline_raw, est_fichier_sta
 
-    # INITIALISATION ET RAZ DES BUFFERS DÈS QUE REACT SE CONNECTE AU STREAM
     flag = True
     flagScale = True
     scale = 0
-    y_data = np.array([])
+    y_data = np.array([], dtype=np.float64)
     x_data = np.array([])
     y_filtered_data = np.array([])
     dy_dx = np.array([])
 
-    # -------------------------------------------------------------------------
-    # CAS A : SIMULATION DE TRANSMISSION OFF-LINE (900 POINTS EN 30 SECONDES)
-    # -------------------------------------------------------------------------
     if mode_offline_actif and len(signal_offline_raw) > 0:
         print(f"[Streaming Offline] Diffusion de la fenêtre rééchantillonnée (900 points)...")
-        
         for valeur in signal_offline_raw:
             if not flag: break
             y_data = np.append(y_data, valeur)
             x_data = np.append(x_data, x_data.size / 30)
             yield f"data: {valeur}\n\n"
             time.sleep(0.001) 
-            
         yield "data: ENDRAW\n\n"
 
-        # TRAITEMENT DU SIGNAL ADAPTATIF OFFLINE
         if len(y_data) > butter_order * 5:
             if est_fichier_sta:
-                # BRANCHEMENT DIRECT VENTILATEUR : Pas de filtrage, le signal brut est préservé à 100%
                 print("[Traitement] Signal .sta détecté : Shunt du filtrage Butterworth.")
                 y_filtered_data = np.copy(y_data)
             else:
-                # BRANCHEMENT OPTIQUE (CSV) : Nettoyage des outliers + Filtre à 1.5Hz requis
                 y_data_cleaned = remove_outliers(y_data)
+        
+                # --- ALIGNEMENT ET CORRECTION DU BUG DE VARIABLE ---
                 nyq = 0.5 * sampling_rate_kinect_hz
-                b_adapt, a_adapt = butter(N=2, Wn=1.5 / nyq, btype='low')
+                b_wide, a_wide = butter(N=1, Wn=5.0 / nyq, btype='low')
+                y_wide = filtfilt(b_wide, a_wide, y_data_cleaned)
+                troughs_est, _ = find_peaks(-y_wide, distance=int(sampling_rate_kinect_hz * 0.66))
+        
+                if len(troughs_est) >= 2:
+                    total_points_fenetre = troughs_est[-1] - troughs_est[0]
+                    duree_fenetre_sec = total_points_fenetre / sampling_rate_kinect_hz
+                    FR_estimere = (len(troughs_est) - 1) * 60 / duree_fenetre_sec
+                else:
+                    FR_estimere = 35.0
+                
+                freq_patient_hz = FR_estimere / 60.0
+                fc_adaptative = max(freq_patient_hz * 5.0, 2.0)
+                fc_adaptative = min(fc_adaptative, 5.5)
+            
+                b_adapt, a_adapt = butter(N=1, Wn=fc_adaptative / nyq, btype='low')
                 y_filtered_data = filtfilt(b_adapt, a_adapt, y_data_cleaned)
             
-            # Envoi des données filtrées/préservées
             for value in y_filtered_data:
                 if not flag: break
                 yield f"data: {value}\n\n"
             yield "data: ENDFILTERED\n\n"
             
-            # Dérivée première pour obtenir le débit (Flow)
             dy_dx = np.gradient(y_filtered_data, x_data[:len(y_filtered_data)])
             for value in dy_dx:
                 if not flag: break
                 yield f"data: {value}\n\n"
-                
         yield "data: END\n\n"
-        print("[Streaming Offline] Fin de la transmission offline.")
         return
 
-    # -------------------------------------------------------------------------
-    # CAS B : MODE VIDEO ACQUISITION KINECT (D'ORIGINE INCHANGÉ)
-    # -------------------------------------------------------------------------
     conn = None
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -178,7 +169,7 @@ def generate_data():
 
                     try:
                         clean_numeric = data_clean.replace(',', '.')
-                        y_value = -float(clean_numeric)
+                        y_value = -float(clean_numeric.replace(',', '.'))
 
                         if flagScale:
                             scale = y_value
@@ -200,14 +191,22 @@ def generate_data():
     store_non_filtered_data_in_csv(y_data_cleaned)
 
     if len(y_data_cleaned) > butter_order * 5:
-        b_wide, a_wide = butter(N=2, Wn=4.0 / (0.5 * sampling_rate_kinect_hz), btype='low')
+        b_wide, a_wide = butter(N=1, Wn=5.0 / (0.5 * sampling_rate_kinect_hz), btype='low')
         y_wide = filtfilt(b_wide, a_wide, y_data_cleaned)
-        troughs_est, _ = find_peaks(-y_wide, distance=20)
+        troughs_est, _ = find_peaks(-y_wide, distance=int(sampling_rate_kinect_hz * 0.66))
         
-        FR_estimere = (len(troughs_est) - 1) * 60 / (x_data[troughs_est[-1]] - x_data[troughs_est[0]]) if len(troughs_est) >= 2 else 35.0
-        fc_adaptative = min(max(FR_estimere / 60.0 * 3.0, 1.2), 4.5)
+        if len(troughs_est) >= 2:
+            total_points_fenetre = troughs_est[-1] - troughs_est[0]
+            duree_fenetre_sec = total_points_fenetre / sampling_rate_kinect_hz
+            FR_estimere = (len(troughs_est) - 1) * 60 / duree_fenetre_sec
+        else:
+            FR_estimere = 35.0
+            
+        freq_patient_hz = FR_estimere / 60.0
+        fc_adaptative = max(freq_patient_hz * 5.0, 2.0)
+        fc_adaptative = min(fc_adaptative, 5.5)
         
-        b_adapt, a_adapt = butter(N=2, Wn=fc_adaptative / (0.5 * sampling_rate_kinect_hz), btype='low')
+        b_adapt, a_adapt = butter(N=1, Wn=fc_adaptative / (0.5 * sampling_rate_kinect_hz), btype='low')
         y_filtered_data = filtfilt(b_adapt, a_adapt, y_data_cleaned)
         store_data_in_csv(y_filtered_data)
         
@@ -229,8 +228,6 @@ def run_analysis():
         data = request.get_json() or {}
         fichier_cible = data.get('filename', '').strip()
         current_filename = fichier_cible
-        
-        # FORCE LA CONVERSION EN ENTIER (ex: 28.0 devient 28)
         temps_depart_sec = int(float(data.get('start_time', 0)))
         
         ext = os.path.splitext(fichier_cible)[1].lower()
@@ -245,10 +242,7 @@ def run_analysis():
             
             nom_mkv_pur = fichier_cible.replace('.mkv', '')
             arguments = [file_path, nom_mkv_pur, str(temps_depart_sec)]
-            
             subprocess.Popen(arguments, cwd=racine_dir, creationflags=0x00000010)
-            
-            print(f"[Succès MKV] Lancement de {file_path} avec {nom_mkv_pur} à {temps_depart_sec} secondes.")
             return jsonify({"message": f"Acquisition vidéo démarrée pour : {fichier_cible} (Départ: {temps_depart_sec}s)"}), 200
 
         else:
@@ -276,18 +270,17 @@ def run_analysis():
 
             if len(signal_complet) > 0:
                 index_debut = int(temps_depart_sec * fs)
-                index_fin = int((temps_depart_sec + 30.0) * fs)
-                
+                index_fin = index_debut + int(30.0 * fs)
+    
                 if index_debut >= len(signal_complet): index_debut = 0
                 if index_fin > len(signal_complet): index_fin = len(signal_complet)
-                
-                signal_fenetre = signal_complet[index_debut:index_fin]
-                
-                temps_original = np.arange(len(signal_fenetre)) / fs
-                temps_cible = np.arange(900) / 30.0
-                signal_harmonisie = np.interp(temps_cible, temps_original, signal_fenetre)
-                
-                signal_offline_raw = [float(v) for v in (signal_harmonisie - signal_harmonisie[0])]
+    
+                signal_brut_fenetre = signal_complet[index_debut:index_fin]
+    
+                pas = max(1, len(signal_brut_fenetre) // 900)
+                signal_final = signal_brut_fenetre[::pas][:900] 
+    
+                signal_offline_raw = [float(v) for v in (signal_final - signal_final[0])]
 
             return jsonify({"message": f"Fichier préparé et harmonisé de {temps_depart_sec}s à {temps_depart_sec + 30}s."}), 200
 
@@ -300,35 +293,54 @@ def send_stats():
     if len(y_filtered_data) == 0:
         return jsonify({"message": "Aucune donnée filtrée disponible."}), 400
 
-    troughs_pre, _ = find_peaks(-y_filtered_data, distance=20)
-    FR_mesuree = (len(troughs_pre) - 1) * 60 / (x_data[troughs_pre[-1]] - x_data[troughs_pre[0]]) if len(troughs_pre) >= 2 else 35.0
+    fs = float(sampling_rate_kinect_hz)
 
-    dist_adaptative = max(int((30 * 60) / FR_mesuree * 0.6), 10)
+    troughs_pre, _ = find_peaks(-y_filtered_data, distance=int(fs * 0.5))
+    if len(troughs_pre) >= 2:
+        FR_mesuree = (len(troughs_pre) - 1) * 60 / (x_data[troughs_pre[-1]] - x_data[troughs_pre[0]])
+    else:
+        FR_mesuree = 35.0
+
+    dist_adaptative = max(int((fs * 60) / FR_mesuree * 0.6), 10)
     amp_vol = np.percentile(y_filtered_data, 98) - np.percentile(y_filtered_data, 2)
-    peaks, troughs = find_peaks(y_filtered_data, distance=dist_adaptative, prominence=amp_vol * 0.15)[0], find_peaks(-y_filtered_data, distance=dist_adaptative, prominence=amp_vol * 0.15)[0]
+    
+    peaks, _ = find_peaks(y_filtered_data, distance=dist_adaptative, prominence=amp_vol * 0.15)
+    troughs, _ = find_peaks(-y_filtered_data, distance=dist_adaptative, prominence=amp_vol * 0.15)
 
     volume, inspiration_time, expiration_time = [], [], []
     inspiration_time_mean, expiration_time_mean, volume_minute = 0, 0, 0
 
-    if len(peaks) > 0 and len(troughs) >= 2:
-        if peaks[0] < troughs[0]: peaks = peaks[1:]
-        if len(peaks) > 0 and peaks[-1] > troughs[-1]: peaks = peaks[:-1]
-
-        if len(peaks) + 1 == len(troughs) and len(peaks) > 0:
-            for i in range(2, len(troughs) + 1, 1):
-                volume.append(float(y_filtered_data[peaks[i - 2]] - y_filtered_data[troughs[i - 1]]))
-                inspiration_time.append(float(x_data[peaks[i - 2]] - x_data[troughs[i - 2]]))
-                expiration_time.append(float(x_data[troughs[i - 1]] - x_data[peaks[i - 2]]))
+    # --- RESTRUCTURATION ROBUSTE DU COUPLAGE CYCLE PAR CYCLE (IDENTIQUE OFFLINE) ---
+    if len(peaks) >= 2 and len(troughs) >= 1:
+        for i in range(1, len(peaks)):
+            vallees_avant = troughs[troughs < peaks[i]]
+            if len(vallees_avant) > 0:
+                derniere_vallee = vallees_avant[-1]
+                volume.append(float(y_filtered_data[peaks[i]] - y_filtered_data[derniere_vallee]))
+                inspiration_time.append(float(x_data[peaks[i]] - x_data[derniere_vallee]))
+                expiration_time.append(float(x_data[derniere_vallee] - x_data[peaks[i - 1]]))
+        
+        if len(troughs) >= 2:
             volume_minute = sum(volume) * 60 / (x_data[troughs[-1]] - x_data[troughs[0]])
-            inspiration_time_mean = np.mean(inspiration_time)
-            expiration_time_mean = np.mean(expiration_time)
+        inspiration_time_mean = np.mean(inspiration_time) if inspiration_time else 0
+        expiration_time_mean = np.mean(expiration_time) if expiration_time else 0
 
-    dist_deriv = max(int(dist_adaptative / 2), 8)
-    seuil_prominence_debit = (np.percentile(dy_dx, 95) - np.percentile(dy_dx, 5)) * 0.35  
+    if len(troughs) >= 2:
+        fr_moyenne_globale = (len(troughs) - 1) * 60 / (x_data[troughs[-1]] - x_data[troughs[0]])
+    elif len(peaks) >= 2:
+        fr_moyenne_globale = (len(peaks) - 1) * 60 / (x_data[peaks[-1]] - x_data[peaks[0]])
+    else:
+        fr_moyenne_globale = FR_mesuree
+
+    dist_deriv = max(int(dist_adaptative * 0.75), 12)
+    seuil_prominence_debit = (np.percentile(dy_dx, 95) - np.percentile(dy_dx, 5)) * 0.50  
+    
     peaks_derivative, troughs_derivative = find_peaks(dy_dx, distance=dist_deriv, prominence=seuil_prominence_debit)[0], find_peaks(-dy_dx, distance=dist_deriv, prominence=seuil_prominence_debit)[0]
     
-    if len(peaks_derivative) == 0: peaks_derivative = find_peaks(dy_dx, distance=dist_deriv)[0]
-    if len(troughs_derivative) == 0: troughs_derivative = find_peaks(-dy_dx, distance=dist_deriv)[0]
+    if len(peaks_derivative) == 0: 
+        peaks_derivative = find_peaks(dy_dx, distance=dist_deriv, prominence=seuil_prominence_debit * 0.5)[0]
+    if len(troughs_derivative) == 0: 
+        troughs_derivative = find_peaks(-dy_dx, distance=dist_deriv, prominence=seuil_prominence_debit * 0.5)[0]
     
     peak_flow_mean = np.mean(dy_dx[peaks_derivative]) if len(peaks_derivative) > 0 else 0
     troughs_flow_mean = np.mean(-dy_dx[troughs_derivative]) if len(troughs_derivative) > 0 else 0
@@ -338,63 +350,51 @@ def send_stats():
     else:
         rapport_ie = "1/0"
 
-    # =========================================================================
-    # SAUVEGARDE AUTOMATIQUE SÉCURISÉE (MKV / ONLINE ONLY)
-    # =========================================================================
+    nom_base = request.args.get('filename', current_filename).strip()
+
     if not mode_offline_actif:
         try:
             import pandas as pd
-            import matplotlib.pyplot as plt
-            
             output_dir = './output'
             os.makedirs(output_dir, exist_ok=True)
-            
-            nom_base = request.args.get('filename', current_filename).strip()
 
-            # 1. Sauvegarde du fichier Cycle par Cycle
             resultats_cycles = []
             for i in range(len(volume)):
-                resultats_cycles.append({
-                    "Numero_Cycle": i + 1,
-                    "Temps_Sec": round(float(x_data[peaks[i]]), 2) if i < len(peaks) else 0,
-                    "Duree_Cycle_Sec": round(inspiration_time[i] + expiration_time[i], 2),
-                    "FR_instantanee_CPM": round(60.0 / (inspiration_time[i] + expiration_time[i]), 1) if (inspiration_time[i] + expiration_time[i]) > 0 else 0,
-                    "Amplitude_Cycle": round(volume[i], 3)
-                })
+                p_idx = i + 1
+                if p_idx < len(peaks):
+                    duree_c = float(x_data[peaks[p_idx]] - x_data[peaks[p_idx - 1]])
+                    resultats_cycles.append({
+                        "Numero_Cycle": i + 1,
+                        "Temps_Sec": round(float(x_data[peaks[p_idx]]), 2),
+                        "Duree_Cycle_Sec": round(duree_c, 2),
+                        "FR_instantanee_CPM": round(60.0 / duree_c, 1) if duree_c > 0 else 0,
+                        "Amplitude_Cycle": round(volume[i], 3)
+                    })
             
             if resultats_cycles:
                 df_cycles = pd.DataFrame(resultats_cycles)
                 df_cycles.to_csv(os.path.join(output_dir, f"{nom_base}_analyse_cycles.csv"), index=False, encoding='utf-8')
 
-            # 2. Sauvegarde du Résumé Global
             df_resume = pd.DataFrame([{
-                "Fichier_Source": nom_base,
-                "Type_Signal": "Amplitude 3DRespiView Live",
+                "Fichier_Source": nom_base, "Type_Signal": "Amplitude 3DRespiView Live",
                 "Duree_Total_Sec": round(float(x_data[-1]), 2) if len(x_data) > 0 else 0,
-                "Total_Cycles": len(peaks),
-                "FR_Moyenne_CPM": round(FR_mesuree, 2),
+                "Total_Cycles": len(peaks), "FR_Moyenne_CPM": round(fr_moyenne_globale, 2),
                 "Amplitude_Moyenne": round(np.mean(volume), 2) if len(volume) > 0 else 0
             }])
             df_resume.to_csv(os.path.join(output_dir, f"{nom_base}_resume_global.csv"), index=False, encoding='utf-8')
 
-            # 3. Génération de la courbe graphique de contrôle
-            plt.figure(figsize=(12, 6))
-            plt.plot(y_filtered_data, label="Signal Filtré Adaptatif", color="blue", linewidth=1.2)
-            plt.scatter(peaks, y_filtered_data[peaks], color="red", marker="^", s=50, label="Pics")
-            plt.scatter(troughs, y_filtered_data[troughs], color="green", marker="v", s=50, label="Creux")
-            plt.title(f"Suivi Acquisition - {nom_base}")
-            plt.grid(True, linestyle="--", alpha=0.5)
-            plt.legend(loc="upper right")
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, f"{nom_base}_courbe_analyse.png"), dpi=300)
-            plt.close()
-            print(f"[Sauvegarde] Rapports générés avec succès pour {nom_base}")
-            
+            racine_dir = os.path.dirname(os.path.abspath(__file__))
+            yolo_img_path = os.path.join(racine_dir, 'runs/obb/predict/IR4OBB.jpg')
+            if os.path.exists(yolo_img_path):
+                photo_destination = os.path.join(output_dir, f"{nom_base}_detection_thorax.jpg")
+                shutil.copy(yolo_img_path, photo_destination)
+                print(f"[Photo Saved] Image de suivi YOLO copiée vers : {photo_destination}")
+
         except Exception as e:
             print(f"[Erreur Sauvegarde MKV] Impossible de générer les rapports : {e}")
 
     return jsonify({
-        "Frequence respiratoire (Rpm)": round(FR_mesuree),
+        "Frequence respiratoire (Rpm)": round(fr_moyenne_globale),
         "Volume minute expire (L/min)": round(volume_minute / 1000, 2),
         "Volume courant moyen (mL)": round(np.mean(volume)) if len(volume) > 0 else 0,
         "Temps moyen inspiration (s)": round(inspiration_time_mean, 1),
@@ -423,10 +423,22 @@ def get_image(filename):
 
 @app.route('/close', methods=['POST'])
 def close():
-    try: os.system("taskkill /f /im node.exe")
-    finally: os.kill(os.getpid(), 9)
+    """Ferme proprement l'application backend, frontend et leurs terminaux."""
+    try:
+        racine_dir = os.path.dirname(os.path.abspath(__file__))
+        runs_dir = os.path.join(racine_dir, 'runs')
+        if os.path.exists(runs_dir):
+            shutil.rmtree(runs_dir)
+            print("[Nettoyage Final] Répertoire temporaire YOLO supprimé.")
+        
+        os.system("taskkill /f /im node.exe")
+        os.system("taskkill /f /im cmd.exe")
+
+    except Exception as e:
+        print(f"Erreur lors de la fermeture forcée : {e}")
+    finally:
+        os.kill(os.getpid(), 9)
 
 if __name__ == '__main__':
-    # EXECUTION DU NETTOYAGE DES DOSSIERS AVANT LE LANCEMENT DE L'APP
     clean_output_directories()
     app.run(debug=False, host='127.0.0.1', port=8000, threaded=True)

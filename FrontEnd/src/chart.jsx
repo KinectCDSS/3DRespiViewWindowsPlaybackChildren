@@ -60,7 +60,7 @@ const RealTimeChart = ({ filename, isOffline }) => {
                     filteredDataFlag = false;
                     flowDataFlag = true;
                 }
-                const newData = parseInt(event.data);
+                const newData = parseFloat(event.data);
                 if (rawDataFlag) {
                     setRawData((prevData) => [...prevData, newData]);
                 }
@@ -249,6 +249,12 @@ const RealTimeChart = ({ filename, isOffline }) => {
                     display: true,
                     text: 'Amplitude (mL)'  // Titre de l'axe Y
                 },
+                ticks: {
+                    // Ajoute cette fonction pour forcer l'affichage de 1 ou 2 décimales
+                    callback: function (value, index, values) {
+                        return value.toFixed(1); // Modifiez 1 par 2 si vous voulez deux décimales
+                    }
+                }
             }
         },
         animation: {

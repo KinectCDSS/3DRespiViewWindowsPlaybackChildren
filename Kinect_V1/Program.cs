@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.IO; // Ajouté pour s'assurer que StreamWriter est disponible
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -27,7 +28,6 @@ if (args.Length >= 2)
 }
 else
 {
-    // Mode de repli au cas où le binaire est exécuté à la main
     Console.WriteLine("Entrez le nom du fichier MKV :");
     mkvNameFile = Console.ReadLine();
 
@@ -39,8 +39,9 @@ else
     }
 }
 
-// Construction du chemin définitif vers la vidéo d'entrée
 mkvPath = $@"{mkvPath}\{mkvNameFile}.mkv";
+// Définition du chemin du fichier CSV basé sur le nom du MKV
+string csvOutputPath = $@"{outputDirectoryPath}\{mkvNameFile}.csv";
 
 List<PointF> pointsJoints2DPixelDepthOneFrame = new List<PointF>();
 List<PointF> pointsJoints2DPixelRGBOneFrame = new List<PointF>();
@@ -52,8 +53,13 @@ List<double> volumeList = new List<double>();
 string server = "127.0.0.1";
 int port = 5000;
 bool connected = false;
-
 string pythonExePath = "python";
+
+// --- Variables pour le suivi et la tare ---
+int imageCount = 0;
+int frameCompteur = 0;
+double volumeInitial = 0;
+bool tareEffectuee = false;
 
 while (!connected)
 {
@@ -65,133 +71,130 @@ while (!connected)
             connected = true;
             Directory.CreateDirectory(outputDirectoryPath);
 
-            // Playback mode
-            using (var playback = new Playback(mkvPath))
+            // Modifié : Utilisation de new UTF8Encoding(false) pour supprimer le caractère invisible BOM (\ufeff)
+            using (StreamWriter csvWriter = new StreamWriter(csvOutputPath, false, new UTF8Encoding(false)))
             {
-                RecordConfiguration recordConfig;
-                playback.GetRecordConfiguration(out recordConfig);
+                // Supprimé : csvWriter.WriteLine("Frame;Volume_mL"); -> Plus de ligne de texte au début
 
-                K4AdotNet.Sensor.Calibration deviceCalibration;
-                playback.GetCalibration(out deviceCalibration);
-
-                Console.WriteLine($"Depth Mode: {recordConfig.DepthMode}");
-                Console.WriteLine($"Color Resolution: {recordConfig.ColorResolution}");
-                Console.WriteLine($"Color Format: {recordConfig.ColorFormat}");
-                Console.WriteLine($"FPS: {recordConfig.CameraFps}");
-
-                K4AdotNet.Sensor.Capture sensorCapture;
-
-                // Saut au timestamp spécifié (ex: 28 secondes)
-                playback.SeekTimestamp(Microseconds64.FromSeconds(seconds), PlaybackSeekOrigin.Begin);
-
-                int imageCount = 0;
-                int height_depth = deviceCalibration.DepthCameraCalibration.ResolutionHeight;
-                int width_depth = deviceCalibration.DepthCameraCalibration.ResolutionWidth;
-
-                while (imageCount < 960)
+                using (var playback = new Playback(mkvPath))
                 {
-                    playback.TryGetNextCapture(out sensorCapture);
+                    playback.GetRecordConfiguration(out RecordConfiguration recordConfig);
+                    playback.GetCalibration(out K4AdotNet.Sensor.Calibration deviceCalibration);
 
-                    if (sensorCapture != null && sensorCapture.ColorImage != null && sensorCapture.DepthImage != null && sensorCapture.IRImage != null)
+                    K4AdotNet.Sensor.Capture sensorCapture;
+                    playback.SeekTimestamp(Microseconds64.FromSeconds(seconds), PlaybackSeekOrigin.Begin);
+
+                    int height_depth = deviceCalibration.DepthCameraCalibration.ResolutionHeight;
+                    int width_depth = deviceCalibration.DepthCameraCalibration.ResolutionWidth;
+
+                    while (imageCount < 960)
                     {
-                        imageCount++;
+                        playback.TryGetNextCapture(out sensorCapture);
 
-                        var colorImage = sensorCapture.ColorImage;
-                        var depthImage = sensorCapture.DepthImage;
-                        var irImage = sensorCapture.IRImage;
-
-                        byte[] colorData = new byte[colorImage.SizeBytes];
-                        colorImage.CopyTo(dst: colorData);
-
-                        short[] depthData = new short[height_depth * width_depth];
-                        depthImage.CopyTo(dst: depthData);
-
-                        byte[] irData = new byte[irImage.SizeBytes];
-                        irImage.CopyTo(dst: irData);
-
-                        // Analyse YOLO/OBB à la 30ème frame relative après le saut temporel
-                        if (imageCount == 30)
+                        if (sensorCapture != null && sensorCapture.ColorImage != null && sensorCapture.DepthImage != null && sensorCapture.IRImage != null)
                         {
-                            string rgbname = $@"{outputDirectoryPath}\RGB4OBB.jpg";
-                            string irname = $@"{outputDirectoryPath}\IR4OBB.jpg";
-                            long imageBufferSize = colorImage.SizeBytes;
-                            long imageIRBufferSize = irImage.SizeBytes;
+                            imageCount++;
+                            var colorImage = sensorCapture.ColorImage;
+                            var depthImage = sensorCapture.DepthImage;
+                            var irImage = sensorCapture.IRImage;
 
-                            using (FileStream fileObject = new FileStream(rgbname, FileMode.Create, FileAccess.Write))
+                            byte[] colorData = new byte[colorImage.SizeBytes];
+                            colorImage.CopyTo(dst: colorData);
+                            short[] depthData = new short[height_depth * width_depth];
+                            depthImage.CopyTo(dst: depthData);
+                            byte[] irData = new byte[irImage.SizeBytes];
+                            irImage.CopyTo(dst: irData);
+
+                            if (imageCount == 60)
                             {
-                                fileObject.Write(colorData, 0, (int)imageBufferSize);
-                            }
+                                string rgbname = $@"{outputDirectoryPath}\RGB4OBB.jpg";
+                                string irname = $@"{outputDirectoryPath}\IR4OBB.jpg";
 
-                            SaveIRImage(irData, irImage, irname);
-                            PredictOBB(currentDirectory, pythonExePath, deviceCalibration, depthImage);
-
-                            foreach (PointF point in pointsJoints2DPixelDepthOneFrame)
-                            {
-                                var point2D = new K4AdotNet.Float2(point.X, point.Y);
-                                float depthValue = depthData[(int)point2D.Y * width_depth + (int)point2D.X];
-                                var point2DRGB = deviceCalibration.Convert2DTo2D(point2D, depthValue, K4AdotNet.Sensor.CalibrationGeometry.Depth, K4AdotNet.Sensor.CalibrationGeometry.Color);
-                                Console.WriteLine($"Point RGB : {point2DRGB.Value.X}, {point2DRGB.Value.Y}");
-                                pointsJoints2DPixelRGBOneFrame.Add(new PointF((int)Math.Round(point2DRGB.Value.X), (int)Math.Round(point2DRGB.Value.Y)));
-                            }
-
-                            SaveAllMasks(deviceCalibration, depthImage, width_depth, height_depth, outputDirectoryPath, pointsJoints2DPixelDepthOneFrame, pointsJoints2DPixelRGBOneFrame, rgbname);
-
-                            Bitmap maskRead = new Bitmap($@"{outputDirectoryPath}\RGB_transformed.png");
-
-                            for (int y = 0; y < maskRead.Height; y++)
-                            {
-                                for (int x = 0; x < maskRead.Width; x++)
+                                using (FileStream fileObject = new FileStream(rgbname, FileMode.Create, FileAccess.Write))
                                 {
-                                    Color pixelColor = maskRead.GetPixel(x, y);
-                                    if (pixelColor.R == 255 && pixelColor.G == 0 && pixelColor.B == 0)
+                                    fileObject.Write(colorData, 0, (int)colorImage.SizeBytes);
+                                }
+
+                                SaveIRImage(irData, irImage, irname);
+                                PredictOBB(currentDirectory, pythonExePath, deviceCalibration, depthImage, pointsJoints2DPixelDepthOneFrame);
+
+                                foreach (PointF point in pointsJoints2DPixelDepthOneFrame)
+                                {
+                                    var point2D = new K4AdotNet.Float2(point.X, point.Y);
+                                    float depthValue = depthData[(int)point2D.Y * width_depth + (int)point2D.X];
+                                    var point2DRGB = deviceCalibration.Convert2DTo2D(point2D, depthValue, K4AdotNet.Sensor.CalibrationGeometry.Depth, K4AdotNet.Sensor.CalibrationGeometry.Color);
+                                    pointsJoints2DPixelRGBOneFrame.Add(new PointF((int)Math.Round(point2DRGB.Value.X), (int)Math.Round(point2DRGB.Value.Y)));
+                                }
+
+                                SaveAllMasks(deviceCalibration, depthImage, width_depth, height_depth, outputDirectoryPath, pointsJoints2DPixelDepthOneFrame, pointsJoints2DPixelRGBOneFrame, rgbname);
+                                Bitmap maskRead = new Bitmap($@"{outputDirectoryPath}\RGB_transformed.png");
+                                for (int y = 0; y < maskRead.Height; y++)
+                                {
+                                    for (int x = 0; x < maskRead.Width; x++)
                                     {
-                                        int pixelIndex = y * maskRead.Width + x;
-                                        pixelsIndexMask.Add(pixelIndex);
-                                        countMaskPixels += 1;
+                                        Color pixelColor = maskRead.GetPixel(x, y);
+                                        if (pixelColor.R == 255 && pixelColor.G == 0 && pixelColor.B == 0)
+                                        {
+                                            pixelsIndexMask.Add(y * maskRead.Width + x);
+                                        }
                                     }
                                 }
+                                SurfaceDepthsPixels(pixelsIndexMask, surfaceList, deviceCalibration, depthData, width_depth, height_depth);
                             }
 
-                            SurfaceDepthsPixels(pixelsIndexMask, surfaceList, deviceCalibration, depthData, width_depth, height_depth);
-                        }
-
-                        if (imageCount > 60)
-                        {
-                            double volume_new = 0;
-                            for (int i = 0; i < surfaceList.Count; i++)
+                            if (imageCount > 60)
                             {
-                                double pixel_k_profondeur = depthData[pixelsIndexMask[i]];
-                                double volume_pixel = surfaceList[i] * pixel_k_profondeur;
-                                volume_new += volume_pixel;
+                                frameCompteur++;
+                                double volume_new = 0;
+                                for (int i = 0; i < surfaceList.Count; i++)
+                                {
+                                    volume_new += surfaceList[i] * depthData[pixelsIndexMask[i]];
+                                }
+
+                                double volumeInmL = volume_new / 1000;
+
+                                if (!tareEffectuee)
+                                {
+                                    volumeInitial = volumeInmL;
+                                    tareEffectuee = true;
+                                }
+
+                                double volumeNormalise = volumeInmL - volumeInitial;
+                                volumeList.Add(volumeNormalise);
+
+                                // Modifié : Le format passe de "000000.000000000" à "0.000000000" pour supprimer les zéros superflus devant.
+                                // Ajout de CultureInfo.InvariantCulture pour garantir que le point (.) reste le séparateur décimal peu importe le PC.
+                                string formattedNumber = volumeNormalise.ToString("0.000000000", System.Globalization.CultureInfo.InvariantCulture);
+                                Console.WriteLine($"Volume normalisé frame {frameCompteur}: {formattedNumber} mL");
+
+                                double volumeInverse = -volumeNormalise;
+                                string formattedNumberCSV = volumeInverse.ToString("0.000000000", System.Globalization.CultureInfo.InvariantCulture);
+
+                                // Modifié : On n'écrit plus le compteur de frame ni le point-virgule, juste le chiffre pur.
+                                csvWriter.WriteLine(formattedNumberCSV);
+
+                                byte[] message = Encoding.ASCII.GetBytes(formattedNumber + "\n");
+                                stream.Write(message, 0, message.Length);
                             }
-
-                            double volumeInmL = volume_new / 1000;
-                            volumeList.Add(volumeInmL);
-                            string formattedNumber = volumeInmL.ToString("000000.000000000");
-                            Console.WriteLine($"Volume pour la frame {imageCount}: {formattedNumber} mL");
-
-                            byte[] message = Encoding.ASCII.GetBytes(formattedNumber + "\n");
-                            stream.Write(message, 0, message.Length);
                         }
                     }
+                    byte[] endMessage = Encoding.ASCII.GetBytes("END\n");
+                    stream.Write(endMessage, 0, endMessage.Length);
+                    stream.Close();
+                    client.Close();
                 }
-                Console.WriteLine($"\rStop Recording. {imageCount} images captured.");
-                byte[] endMessage = Encoding.ASCII.GetBytes("END\n");
-                stream.Write(endMessage, 0, endMessage.Length);
-
-                stream.Close();
-                client.Close();
-            }
+            } // Le fichier CSV est automatiquement fermé et enregistré ici à la fin du bloc using
+            Console.WriteLine($"[C#] Fichier CSV sauvegardé avec succès sous : {csvOutputPath}");
         }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"Failed to connect to the server: {ex.Message}");
-        Console.WriteLine("Retrying in 1 seconds...");
+        Console.WriteLine($"Erreur : {ex.Message}. Tentative de reconnexion...");
         System.Threading.Thread.Sleep(1000);
     }
 }
 
+// --- Vos fonctions statiques restent inchangées en dessous ---
 static void SaveIRImage(byte[] irData, K4AdotNet.Sensor.Image irImage, string irname)
 {
     List<double> irValues = new List<double>();
@@ -244,7 +247,7 @@ static void SaveIRImage(byte[] irData, K4AdotNet.Sensor.Image irImage, string ir
     bitmap.Save(irname, System.Drawing.Imaging.ImageFormat.Jpeg);
 }
 
-void PredictOBB(string currentDirectory, string pythonExePath, K4AdotNet.Sensor.Calibration deviceCalibration, K4AdotNet.Sensor.Image depthImage)
+void PredictOBB(string currentDirectory, string pythonExePath, K4AdotNet.Sensor.Calibration deviceCalibration, K4AdotNet.Sensor.Image depthImage, List<PointF> pointsJoints2DPixelDepthOneFrame)
 {
     string scriptPredictPath = currentDirectory + @"\predict.py";
 
